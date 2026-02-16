@@ -11,6 +11,7 @@ miden-client-sqlite-store = "0.12"
 miden-lib = { version = "0.12", default-features = false }
 miden-objects = { version = "0.12", default-features = false, features = ["testing"] }
 miden-crypto = { version = "0.17.1", features = ["executable"] }
+miden-assembly = "0.19"
 
 # Async runtime
 tokio = { version = "1.46", features = ["rt-multi-thread", "macros"] }
