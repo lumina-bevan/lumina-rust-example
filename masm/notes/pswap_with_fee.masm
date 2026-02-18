@@ -1,6 +1,43 @@
+# PSWAP Note Script - Partial Swap with Fee Collection (CLOB Format)
+#
+# This script implements a partial swap note that:
+# 1. Can be partially filled - consumer specifies fill amount via note args
+# 2. Supports reclaim - creator can reclaim assets at any time
+# 3. Supports expiration - returns assets to creator after expiration block
+# 4. Creates P2ID payback notes for the requested asset amount
+# 5. Collects fees via FPI to Fee Oracle and sends to treasury
+#
+# Inputs (16 felts):
+#   0-3:   REQUESTED_ASSET_WORD [amount, 0, suffix, prefix] (FungibleAsset format)
+#   4:     SWAPP_TAG - NoteTag for the SWAPP note (for discoverability)
+#   5:     P2ID_TAG - NoteTag for P2ID payback notes to creator
+#   6-7:   PARENT_SERIAL_0, PARENT_SERIAL_1 (audit trail)
+#   8:     SWAP_COUNT - Number of times this note has been partially filled
+#   9:     EXPIRATION_BLOCK - Block height after which note expires (0 = no expiration)
+#   10-11: PARENT_SERIAL_2, PARENT_SERIAL_3 (audit trail)
+#   12:    CREATOR_PREFIX - Creator account ID prefix
+#   13:    CREATOR_SUFFIX - Creator account ID suffix
+#   14:    TREASURY_PREFIX - Treasury account ID prefix (for fee collection)
+#   15:    TREASURY_SUFFIX - Treasury account ID suffix (for fee collection)
+#
+# Note Args:
+#   [0, 0, 0, fill_amount] - Amount of requested tokens taker wants to fill
+#
+# Outputs:
+#   - If expired: Assets returned to creator via receive_asset
+#   - If creator reclaims: Assets returned to creator via receive_asset
+#   - Partial fill: P2ID (fill_amount - fee) to creator + fee P2ID to treasury + leftover PSWAP
+#   - Full fill: P2ID (full - fee) to creator + fee P2ID to treasury
+#
+# Fee Collection:
+#   - Fee rate fetched from Fee Oracle via FPI
+#   - Fee = fill_amount * fee_bps / 10000
+#   - If treasury ID is 0, no fee is collected (full amount goes to maker)
+
 use miden::protocol::active_note
 use miden::protocol::output_note
 use miden::protocol::note
+use miden::standards::attachments::network_account_target
 use miden::standards::wallets::basic->wallet
 use miden::core::sys
 use miden::protocol::active_account
@@ -12,9 +49,25 @@ use miden::core::crypto::hashes::rpo256
 # =================================================================================================
 
 const PUBLIC_NOTE = 1
+const PRIVATE_NOTE = 2
 const EXECUTION_HINT_ALWAYS = 1
 const FACTOR = 0x000186A0 # 1e5
 const MAX_U32 = 0x0000000100000000
+const FEE_DENOMINATOR = 10000
+
+# Fee Oracle Configuration (deployed testnet)
+# Oracle Address: 0x085e1bc7eb50221010055105b091fb
+# Treasury: 0x578af91cb3aa611004354e52386457
+const FEE_ORACLE_PREFIX = 0x085e1bc7eb50221
+const FEE_ORACLE_SUFFIX = 0x010055105b091fb
+
+# Procedure MAST roots (from compiled Fee Oracle)
+# get_fee_bps: Returns current fee in basis points
+const GET_FEE_BPS_HASH_0 = 0x5975cc7bc789e292
+const GET_FEE_BPS_HASH_1 = 0x07c773a6f2ef5804
+const GET_FEE_BPS_HASH_2 = 0x57a4c0788fd079b5
+const GET_FEE_BPS_HASH_3 = 0x4f62f0774d5e8d88
+
 
 # Memory Addresses
 # =================================================================================================
@@ -44,6 +97,8 @@ const PARENT_SERIAL_2 = 0x000A  # serial[2]
 const PARENT_SERIAL_3 = 0x000B  # serial[3] - top of original word
 const SWAPP_CREATOR_PREFIX_INPUT = 0x000C
 const SWAPP_CREATOR_SUFFIX_INPUT = 0x000D
+const TREASURY_PREFIX_INPUT = 0x000E
+const TREASURY_SUFFIX_INPUT = 0x000F
 
 # RESERVED INPUT MEMORY ADDRESSES 0 to 40
 
@@ -51,7 +106,7 @@ const SWAPP_CREATOR_SUFFIX_INPUT = 0x000D
 const AMT_TOKENS_A = 0x0028
 const AMT_TOKENS_B = 0x0029
 const AMT_TOKENS_B_IN = 0x002A
-const AMT_TOKENS_A_OUT = 0x002B
+const AMT_TOKENS_A_OUT =  0x002B
 const RATIO = 0x002C
 
 # TokenId Memory Addresses (60 to 70)
@@ -72,14 +127,21 @@ const P2ID_OUTPUT_RECIPIENT_WORD = 0x0060
 const OFFERED_ASSET_WORD = 0x0064
 
 # Temporary Memory Addresses
-
 const NEW_ASSET_A = 0x0078
+
+# Fee Collection Memory Addresses
+const FEE_BPS = 0x007C
+const FEE_AMOUNT = 0x007D
+const TREASURY_PREFIX = 0x007E
+const TREASURY_SUFFIX = 0x007F
+const FEE_P2ID_SERIAL_WORD = 0x0080  # Word aligned for serial
+const FEE_P2ID_RECIPIENT_WORD = 0x0084  # Word aligned for recipient
 
 # ERRORS
 # =================================================================================================
 
-# SWAP script expects exactly 9 note inputs
-const ERR_SWAP_WRONG_NUMBER_OF_INPUTS = "PSWAP wrong number of inputs"
+# SWAP script expects exactly 16 note inputs
+const ERR_SWAP_WRONG_NUMBER_OF_INPUTS = "PSWAP wrong number of inputs (expected 16)"
 
 # SWAP script requires exactly one note asset
 const ERR_SWAP_WRONG_NUMBER_OF_ASSETS = "PSWAP wrong number of assets"
@@ -90,8 +152,150 @@ const ERR_INVALID_SWAP_AMOUNT = "PSWAP invalid SWAP amount"
 # SWAPp amount must not be 0
 const ERR_INVALID_SWAP_AMOUNT_ZERO = "PSWAP zero SWAP amount"
 
-# SWAP note has expired - only creator can reclaim
-const ERR_SWAP_EXPIRED = "PSWAP note expired - only creator can reclaim"
+# Note has expired - only creator can reclaim
+const ERR_PSWAP_EXPIRED = "PSWAP note expired - only creator can reclaim"
+
+# EXPIRATION CHECK
+# =================================================================================================
+
+#! Checks if the PSWAP note has expired
+#!
+#! A note is expired if:
+#!   - expiration_block > 0 AND
+#!   - current_block >= expiration_block
+#!
+#! Inputs: []
+#! Outputs: [is_expired] (1 if expired, 0 if not)
+#!
+proc is_note_expired
+    # Load inputs to memory first
+    push.0 exec.active_note::get_inputs drop drop
+    # => []
+
+    mem_load.EXPIRATION_BLOCK_INPUT
+    # => [expiration_block]
+
+    # If expiration_block == 0, no expiration
+    dup push.0 eq
+    # => [is_zero, expiration_block]
+
+    if.true
+        # No expiration set
+        drop push.0
+        # => [0] (not expired)
+    else
+        # Check if current block >= expiration_block (i.e., is expired)
+        exec.tx::get_block_number
+        # => [current_block, expiration_block]
+        #
+        # gte pops [b, a] and returns (a >= b)
+        # With [current_block, expiration_block]:
+        #   b = current_block (top), a = expiration_block (below)
+        #   Returns: expiration_block >= current_block - WRONG!
+        #
+        # We need: current_block >= expiration_block
+        # So swap first to get [expiration_block, current_block]
+        # Then gte: a = current_block, b = expiration_block
+        # Returns: current_block >= expiration_block - CORRECT!
+
+        swap
+        # => [expiration_block, current_block]
+
+        gte
+        # => [current_block >= expiration_block] = [is_expired]
+    end
+    # => [is_expired]
+end
+
+# FEE ORACLE FPI PROCEDURES
+# =================================================================================================
+
+#! Fetches current fee rate from Lumina Fee Oracle via FPI.
+#!
+#! Inputs: []
+#! Outputs: [fee_bps]
+#!
+#! Note: The Fee Oracle must be included as a ForeignAccount in the
+#! transaction request built by the matcher/client.
+proc get_fee_from_oracle
+    # Build FPI call frame expected by tx::execute_foreign_procedure:
+    # [foreign_account_id_prefix, foreign_account_id_suffix, FOREIGN_PROC_ROOT, <foreign inputs>, pad(n)]
+    # with n = 16 - mem_addr_size(1) - foreign_inputs_len(1) = 14.
+    repeat.14
+        push.0
+    end
+    # => [pad(14)]
+
+    # One placeholder input that get_fee_bps consumes/replaces.
+    push.0
+    # => [foreign_input_placeholder, pad(14)]
+
+    # MAST root is a 256-bit hash split into 4 felts
+    push.GET_FEE_BPS_HASH_0.GET_FEE_BPS_HASH_1.GET_FEE_BPS_HASH_2.GET_FEE_BPS_HASH_3
+    # => [MAST_ROOT, foreign_input_placeholder, pad(14)]
+
+    push.FEE_ORACLE_SUFFIX
+    push.FEE_ORACLE_PREFIX
+    # => [prefix, suffix, MAST_ROOT, foreign_input_placeholder, pad(14)]
+
+    # Execute foreign procedure call
+    exec.tx::execute_foreign_procedure
+    # => [fee_bps]
+end
+
+#! Returns treasury ID from note inputs.
+#!
+#! Inputs: [] (reads from memory where note inputs were stored)
+#! Outputs: [treasury_prefix, treasury_suffix]
+#!
+proc get_treasury_id
+    mem_load.TREASURY_PREFIX_INPUT
+    mem_load.TREASURY_SUFFIX_INPUT
+    # => [treasury_suffix, treasury_prefix]
+    swap
+    # => [treasury_prefix, treasury_suffix]
+end
+
+#! Calculate fee amount from gross amount.
+#!
+#! Inputs: [amount, fee_bps]
+#! Outputs: [fee_amount]
+#!
+#! Formula: fee = (amount * fee_bps) / 10000
+proc calculate_fee
+    # Stack: [amount, fee_bps]
+    u32split swap drop   # Get lower 32 bits of amount
+    swap
+    u32split swap drop   # Get lower 32 bits of fee_bps
+    # => [fee_bps_u32, amount_u32]
+
+    u32overflowing_mul assertz
+    # => [amount * fee_bps]
+
+    push.FEE_DENOMINATOR
+    u32div
+    # => [fee_amount]
+end
+
+#! Build P2ID recipient hash for treasury fee note
+#!
+#! Inputs: [SERIAL_NUM]
+#! Outputs: [FEE_P2ID_RECIPIENT]
+#!
+proc build_fee_p2id_recipient_hash
+    padw mem_loadw_be.P2ID_SCRIPT_ROOT_WORD
+    # => [SERIAL_NUM, SCRIPT_HASH]
+
+    # Store treasury note inputs (suffix, prefix) at address 5000
+    mem_load.TREASURY_SUFFIX mem_load.TREASURY_PREFIX
+    push.0.0
+    push.5000 mem_storew_be dropw
+
+    # build_recipient: [inputs_ptr, num_inputs, SERIAL_NUM, SCRIPT_ROOT] => [RECIPIENT]
+    push.2 push.5000
+    exec.note::build_recipient
+    # => [FEE_P2ID_RECIPIENT]
+end
 
 # PRICE CALCULATION
 # =================================================================================================
@@ -177,16 +381,10 @@ end
 #! Outputs: [P2ID_RECIPIENT]
 #!
 proc build_p2id_recipient_hash
-    # Input: [SERIAL_NUM, SCRIPT_HASH]
-    # Output: [P2ID_RECIPIENT]
-
-    # Store P2ID note inputs (creator suffix, prefix) packed into a word at address 4000
-    # Same layout as get_inputs: input[0]=suffix at elem[0], input[1]=prefix at elem[1]
-    mem_load.SWAPP_CREATOR_SUFFIX_INPUT
-    mem_load.SWAPP_CREATOR_PREFIX_INPUT
+    # Store P2ID note inputs (creator suffix, prefix) at address 4000
+    mem_load.SWAPP_CREATOR_SUFFIX_INPUT mem_load.SWAPP_CREATOR_PREFIX_INPUT
     push.0.0
     push.4000 mem_storew_be dropw
-    # => [SERIAL_NUM, SCRIPT_HASH]
 
     # build_recipient: [inputs_ptr, num_inputs, SERIAL_NUM, SCRIPT_ROOT] => [RECIPIENT]
     push.2 push.4000
@@ -271,56 +469,7 @@ proc is_consumer_is_creator
     # => [is_creator]
 end
 
-#! Checks if the PSWAP note has expired
-#!
-#! A note is expired if:
-#!   - expiration_block > 0 AND
-#!   - current_block >= expiration_block
-#!
-#! Inputs: []
-#! Outputs: [is_expired] (1 if expired, 0 if not)
-#!
-proc is_note_expired
-    # Load inputs to memory first
-    push.0 exec.active_note::get_inputs drop drop
-    # => []
-
-    mem_load.EXPIRATION_BLOCK_INPUT
-    # => [expiration_block]
-
-    # If expiration_block == 0, no expiration
-    dup push.0 eq
-    # => [is_zero, expiration_block]
-
-    if.true
-        # No expiration set
-        drop push.0
-        # => [0] (not expired)
-    else
-        # Check if current block >= expiration_block (i.e., is expired)
-        exec.tx::get_block_number
-        # => [current_block, expiration_block]
-        #
-        # gte pops [b, a] and returns (a >= b)
-        # With [current_block, expiration_block]:
-        #   b = current_block (top), a = expiration_block (below)
-        #   Returns: expiration_block >= current_block - WRONG!
-        #
-        # We need: current_block >= expiration_block
-        # So swap first to get [expiration_block, current_block]
-        # Then gte: a = current_block, b = expiration_block
-        # Returns: current_block >= expiration_block - CORRECT!
-
-        swap
-        # => [expiration_block, current_block]
-
-        gte
-        # => [current_block >= expiration_block] = [is_expired]
-    end
-    # => [is_expired]
-end
-
-#! Sends Assets in Note to Consuming Account
+#! Sends Assets in Note to Consuming Account (used for reclaim/expiry)
 #!
 #! Inputs: []
 #! Outputs: []
@@ -335,28 +484,28 @@ proc handle_reclaim
     dropw
 end
 
-# Partially Fillable Swap Script (PSWAP)
+# Partially Fillable Swap Script (SWAPp)
 # =================================================================================================
 #
-# Partially Fillable Swap Script (PSWAP): adds an asset from the note into consumers account and
+# Partially Fillable Swap Script (SWAPp): adds an asset from the note into consumers account and
 # creates a note consumable by note issuer containing requested ASSET.
 #
 # If the consuming account does not have sufficient liquidity to completely
-# fill the amount of the PSWAP creator's requested asset, then the PSWAP note:
+# fill the amount of the SWAPp creator's requested asset, then the SWAPp note:
 #  1) Computes the ratio of token_a to token_b, where token_a is the offered asset,
 #     and where token_b is the requested asset
 #  2) Calculates the amount of token_a to send to the consumer based on the the
 #     amount of token_b sent via P2ID to the creator
-#  3) Outputs a new PSWAP note with the remaining liquidity of token_a, and the updated
+#  3) Outputs a new SWAPp note with the remaining liquidity of token_a, and the updated
 #     amount of token_b
 #
-# If the consuming account completely fills the amount requested by the PSWAP creator,
+# If the consuming account completely fills the amount requested by the SWAPp creator,
 # only a single P2ID note is outputted.
 #
 # Definitions:
 # 1) the offered asset is referred to as token_a,
 # 2) the requested asset is referred to as token_b,
-# 3) token_b_in is the amount of token_b sent to the PSWAP creator via P2ID from the consuming account
+# 3) token_b_in is the amount of token_b sent to the SWAPp creator via P2ID from the consuming account
 # 4) token_a_out is the amount of token_a sent to the consuming account
 #
 
@@ -385,8 +534,8 @@ proc execute_SWAPp
     push.0 exec.active_note::get_inputs
     # => [num_inputs, inputs_ptr]
 
-    # make sure the number of inputs is N
-    eq.14 assert.err=ERR_SWAP_WRONG_NUMBER_OF_INPUTS
+    # make sure the number of inputs is 14
+    eq.16 assert.err=ERR_SWAP_WRONG_NUMBER_OF_INPUTS
     # => [inputs_ptr]
 
     mem_loadw_be.REQUESTED_ASSET_WORD_INPUT
@@ -462,12 +611,54 @@ proc execute_SWAPp
     end
     # => []
 
-    # 1) send token_b_in amt in to creator
-    # 2) send token_a_out amt to consumer
-    #
+    # =========================================================================
+    # FEE COLLECTION via FPI
+    # =========================================================================
+
+    # Get treasury ID from note inputs
+    exec.get_treasury_id
+    # => [treasury_prefix, treasury_suffix]
+    mem_store.TREASURY_SUFFIX
+    mem_store.TREASURY_PREFIX
+    # => []
+
+    # Check if treasury is configured (prefix != 0)
+    # If treasury is 0, skip fee collection entirely
+    mem_load.TREASURY_PREFIX push.0 eq
+    # => [is_treasury_zero]
+
+    if.true
+        # No treasury configured, set fee to 0
+        push.0 mem_store.FEE_BPS
+        push.0 mem_store.FEE_AMOUNT
+    else
+        # Get fee rate from Fee Oracle via FPI
+        exec.get_fee_from_oracle
+        # => [fee_bps]
+        mem_store.FEE_BPS
+        # => []
+
+        # Calculate fee: fee = (fill_amount * fee_bps) / 10000
+        mem_load.AMT_TOKENS_B_IN
+        mem_load.FEE_BPS
+        # => [fee_bps, fill_amount]
+        exec.calculate_fee
+        # => [fee_amount]
+        mem_store.FEE_AMOUNT
+        # => []
+    end
+
+    # =========================================================================
+    # SWAP OPERATIONS
+    # =========================================================================
+
+    # 1) send (token_b_in - fee) amt to creator via P2ID
+    # 2) send fee amt to treasury via P2ID
+    # 3) send token_a_out amt to consumer
+
     # If Partial Fill:
-    # 3) create SWAPp' and calculate token_a' & token_b'
-    # 4) add token_a' and token_b' to SWAPp'
+    # 4) create SWAPp' and calculate token_a' & token_b'
+    # 5) add token_a' and token_b' to SWAPp'
 
     padw mem_loadw_be.P2ID_SCRIPT_ROOT_WORD
     # => [P2ID_SCRIPT_HASH]
@@ -491,26 +682,109 @@ proc execute_SWAPp
     # => [P2ID_RECIPIENT]
 
     push.PUBLIC_NOTE
-    # => [note_type, P2ID_RECIPIENT]
+    # => [public_note, P2ID_RECIPIENT]
 
     mem_load.P2ID_TAG_INPUT
-    # => [tag, note_type, P2ID_RECIPIENT]
+    # => [tag, note_type, RECIPIENT]
 
-    # v0.13 API: [tag, note_type, RECIPIENT] => [note_idx]
     call.output_note::create
     # => [note_idx, pad(15) ...]
 
-    mem_load.AMT_TOKENS_B_IN
+    # Send (fill_amount - fee) to maker via P2ID
+    mem_load.AMT_TOKENS_B_IN mem_load.FEE_AMOUNT sub
+    # => [net_amount, note_idx, pad(15)]
     push.0
     mem_load.TOKEN_B_ID_SUFFIX
     mem_load.TOKEN_B_ID_PREFIX
-    # => [ASSET, note_idx]
+    # => [ASSET (net), note_idx]
 
     call.wallet::move_asset_to_note
     # => [ASSET, note_ix, pad(11)]
 
     dropw drop
     # => []
+
+    # =========================================================================
+    # CREATE FEE P2ID NOTE TO TREASURY (if fee > 0)
+    # =========================================================================
+
+    mem_load.FEE_AMOUNT push.0 neq
+    # => [has_fee]
+
+    if.true
+        # Generate unique serial for fee note: hash(swap_serial, swap_count, "fee")
+        exec.active_note::get_serial_number
+        # => [SWAP_SERIAL_NUM]
+
+        mem_load.SWAPP_COUNT_INPUT push.1 add  # count + 1 to differentiate from maker P2ID
+        # => [count+1, SWAP_SERIAL_NUM]
+
+        push.0.0.0 movup.3
+        # => [0, 0, 0, count+1, SWAP_SERIAL_NUM]
+
+        # => [FEE_COUNT_WORD, SWAP_SERIAL_NUM]
+        swapw
+        # => [SWAP_SERIAL_NUM, FEE_COUNT_WORD]
+
+        hmerge
+        # => [FEE_P2ID_SERIAL_NUM]
+
+        mem_storew_be.FEE_P2ID_SERIAL_WORD dropw
+        # => []
+
+        # Build fee recipient hash
+        padw mem_loadw_be.FEE_P2ID_SERIAL_WORD
+        # => [FEE_P2ID_SERIAL_NUM]
+
+        exec.build_fee_p2id_recipient_hash
+        # => [FEE_P2ID_RECIPIENT]
+
+        push.PUBLIC_NOTE
+        push.0  # tag (generic tag for treasury)
+
+        # => [tag, note_type, FEE_P2ID_RECIPIENT]
+        call.output_note::create
+        # => [fee_note_idx, pad(15)]
+
+        # Add fee asset to fee note
+        mem_load.FEE_AMOUNT
+        push.0
+        mem_load.TOKEN_B_ID_SUFFIX
+        mem_load.TOKEN_B_ID_PREFIX
+        # => [FEE_ASSET, fee_note_idx]
+
+        call.wallet::move_asset_to_note
+        # => [FEE_ASSET, fee_note_idx, pad(11)]
+
+        # Keep fee note index and set network-account-target attachment so
+        # network treasury accounts can auto-consume this fee note.
+        dropw
+        # => [fee_note_idx, pad(11)]
+
+        drop drop drop drop drop drop drop drop drop drop drop
+        # => [fee_note_idx]
+
+        push.EXECUTION_HINT_ALWAYS
+        mem_load.TREASURY_SUFFIX
+        mem_load.TREASURY_PREFIX
+        # => [treasury_prefix, treasury_suffix, exec_hint, fee_note_idx]
+
+        exec.network_account_target::new
+        # => [attachment_scheme, attachment_kind, ATTACHMENT, fee_note_idx]
+
+        movup.6
+        # => [fee_note_idx, attachment_scheme, attachment_kind, ATTACHMENT]
+
+        exec.output_note::set_attachment
+        # => []
+    else
+        # No fee to collect
+        nop
+    end
+
+    # =========================================================================
+    # TAKER RECEIVES OFFERED ASSET
+    # =========================================================================
 
     mem_load.AMT_TOKENS_A_OUT
     push.0
@@ -548,11 +822,11 @@ proc execute_SWAPp
         mem_store.PARENT_SERIAL_0  # slot 6  <- serial[0]
         # => []
 
-        push.14.0
+        push.16.0
         # => [num_inputs, ptr]
 
         exec.note::compute_inputs_commitment
-        # => [INPUTS_COMMITMENT]
+        # => [INPUTS_HASH]
 
         exec.active_note::get_script_root
         # => [SCRIPT_HASH, INPUTS_HASH]
@@ -563,8 +837,8 @@ proc execute_SWAPp
         exec.note::build_recipient_hash
         # => [RECIPIENT_SWAPP]
 
-        push.PUBLIC_NOTE
-        # => [note_type, SWAPp_RECIPIENT]
+        push.PRIVATE_NOTE
+        # => [private_note, SWAPp_RECIPIENT]
 
         mem_load.SWAPP_TAG_INPUT
         # => [tag, note_type, SWAPp_RECIPIENT]
@@ -581,9 +855,9 @@ proc execute_SWAPp
         # => [ASSET, tag, note_type, SWAPp_RECIPIENT]
 
         mem_storew_be.NEW_ASSET_A dropw
-        # => [tag, note_type, RECIPIENT]
+        # => [tag, note_type, SWAPp_RECIPIENT]
 
-        # SWAPp' creation - v0.13 API: [tag, note_type, RECIPIENT] => [note_idx]
+        # SWAPp' creation
         call.output_note::create
         # => [note_idx, pad(15) ...]
 
@@ -616,7 +890,8 @@ begin
     mem_store.AMT_TOKENS_B_IN drop drop drop
     # => []
 
-    push.3558201871398422326.444910447169617901.15090726097241769395.13362761878458161062
+    # Store P2ID script root (hardcoded from miden-lib)
+    push.15783632360113277539.7403765918285273520.15691985194755641846.10399643920503194563
     mem_storew_be.P2ID_SCRIPT_ROOT_WORD dropw
     # => []
 
@@ -633,7 +908,7 @@ begin
 
         if.true
             # Note is expired - only creator can reclaim, fail transaction
-            push.0 assert.err=ERR_SWAP_EXPIRED
+            push.0 assert.err=ERR_PSWAP_EXPIRED
         else
             # Note is not expired - allow fill
             exec.execute_SWAPp

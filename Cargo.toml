@@ -5,19 +5,20 @@ edition = "2021"
 description = "Minimal example of PSWAP (Partial Swap) on Miden testnet"
 
 [dependencies]
-# Miden SDK v0.12
-miden-client = { version = "0.12", features = ["testing", "tonic"] }
-miden-client-sqlite-store = "0.12"
-miden-lib = { version = "0.12", default-features = false }
-miden-objects = { version = "0.12", default-features = false, features = ["testing"] }
-miden-crypto = { version = "0.17.1", features = ["executable"] }
-miden-assembly = "0.19"
+# Miden SDK v0.13
+miden-client = { version = "0.13", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { version = "0.13", package = "miden-client-sqlite-store" }
+miden-standards = { version = "0.13", default-features = false, package = "miden-standards" }
+miden-protocol = { version = "0.13", default-features = false, features = ["testing"], package = "miden-protocol" }
+miden-crypto = { version = "0.19", features = ["executable"] }
+miden-assembly = "0.20"
 
 # Async runtime
 tokio = { version = "1.46", features = ["rt-multi-thread", "macros"] }
 
 # Randomness
-rand = "0.9"
+rand = { version = "0.9" }
+rand_chacha = "0.9.0"
 
 # Error handling
 anyhow = "1.0"
@@ -25,3 +26,7 @@ anyhow = "1.0"
 [[example]]
 name = "pswap_partial_fill"
 path = "examples/pswap_partial_fill.rs"
+
+[[example]]
+name = "pswap_simple"
+path = "examples/pswap_simple.rs"

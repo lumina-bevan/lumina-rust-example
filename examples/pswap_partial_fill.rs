@@ -32,24 +32,25 @@ use miden_client::{
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
     note::{
-        build_p2id_recipient, build_swap_tag, Note, NoteAssets, NoteExecutionHint,
+        build_p2id_recipient, build_swap_tag, Note, NoteAssets,
         NoteInputs, NoteMetadata, NoteRecipient, NoteTag, NoteType,
     },
     rpc::{domain::account::AccountStorageRequirements, Endpoint, GrpcClient},
     transaction::{ForeignAccount, OutputNote, TransactionRequestBuilder},
-    Felt, ScriptBuilder, Word, ZERO,
+    Felt, Word, ZERO,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use miden_lib::account::auth::AuthRpoFalcon512;
-use miden_objects::{
-    account::{AccountBuilder, AccountComponent, AccountId, AccountStorageMode, AccountType, StorageSlot},
+use miden_standards::account::auth::AuthFalcon512Rpo;
+use miden_protocol::{
+    account::{AccountBuilder, AccountComponent, AccountId, AccountStorageMode, AccountType, StorageSlot, StorageSlotName},
     asset::{Asset, FungibleAsset, TokenSymbol},
     crypto::hash::rpo::Rpo256 as Hasher,
     note::NoteDetails,
+    transaction::TransactionKernel,
 };
-use miden_lib::transaction::TransactionKernel;
 use miden_assembly::mast::MastNodeExt; // For .digest() on MastNode
-use rand::{rngs::StdRng, RngCore};
+use rand::RngCore;
+use miden_client::store::AccountRecordData;
 
 const OFFERED_AMOUNT: u64 = 100_000;
 const REQUESTED_AMOUNT: u64 = 100_000;
@@ -95,8 +96,8 @@ fn create_pswap_note(
     treasury_id: Option<AccountId>,
 ) -> Result<Note> {
 
-    let swapp_tag = build_swap_tag(note_type, &offered_asset, &requested_asset)?;
-    let p2id_tag = NoteTag::from_account_id(creator_id);
+    let swapp_tag = build_swap_tag(note_type, &offered_asset, &requested_asset);
+    let p2id_tag = NoteTag::with_account_target(creator_id);
     let requested_asset_word: Word = requested_asset.into();
 
     println!("\n=== REQUESTED_ASSET WORD (indices 0-3) ===");
@@ -161,13 +162,7 @@ fn create_pswap_note(
 
     let note_inputs = NoteInputs::new(inputs_vec)?;
 
-    let metadata = NoteMetadata::new(
-        last_consumer_id,
-        note_type,
-        swapp_tag,
-        NoteExecutionHint::always(),
-        ZERO,
-    )?;
+    let metadata = NoteMetadata::new(last_consumer_id, note_type, swapp_tag);
     let assets = NoteAssets::new(vec![offered_asset])?;
     let recipient = NoteRecipient::new(serial_num, note_script.clone(), note_inputs);
 
@@ -192,12 +187,14 @@ fn create_leftover_pswap_note(
     note_type: NoteType,
     treasury_id: Option<AccountId>,
 ) -> Result<Note> {
-    // Leftover serial = original serial with last element + 1
+    // Leftover serial must match MASM `get_new_swap_serial_num`:
+    // `active_note::get_serial_number` leaves serial with top limb first and `add` increments
+    // that top limb. In Rust Word indexing, this corresponds to index 0.
     let leftover_serial: Word = [
-        original_serial[0],
+        Felt::new(u64::from(original_serial[0]) + 1),
         original_serial[1],
         original_serial[2],
-        Felt::new(u64::from(original_serial[3]) + 1),
+        original_serial[3],
     ].into();
 
     // Pass original serial as parent serial for audit trail
@@ -223,9 +220,9 @@ fn create_p2id_note_with_serial(
     serial_num: Word,
 ) -> Result<Note> {
     let note_type = NoteType::Public;
-    let tag = NoteTag::from_account_id(target_id);
+    let tag = NoteTag::with_account_target(target_id);
     let recipient = build_p2id_recipient(target_id, serial_num)?;
-    let metadata = NoteMetadata::new(sender_id, note_type, tag, NoteExecutionHint::always(), ZERO)?;
+    let metadata = NoteMetadata::new(sender_id, note_type, tag);
     let note_assets = NoteAssets::new(assets)?;
 
     Ok(Note::new(note_assets, metadata, recipient))
@@ -260,7 +257,7 @@ async fn main() -> Result<()> {
     // Create client
     let endpoint = Endpoint::testnet();
     let rpc = Arc::new(GrpcClient::new(&endpoint, 30_000));
-    let keystore = Arc::new(FilesystemKeyStore::<StdRng>::new(keystore_path.clone())?);
+    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path.clone())?);
 
     let mut client = ClientBuilder::new()
         .rpc(rpc)
@@ -287,11 +284,11 @@ async fn main() -> Result<()> {
 
     // GOLD faucet
     client.rng().fill_bytes(&mut seed);
-    let gold_key = AuthSecretKey::new_rpo_falcon512();
+    let gold_key = AuthSecretKey::new_falcon512_rpo();
     let gold_faucet_account = AccountBuilder::new(seed)
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(gold_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(gold_key.public_key().to_commitment()))
         .with_component(BasicFungibleFaucet::new(
             TokenSymbol::new("GOLD")?,
             0,
@@ -307,11 +304,11 @@ async fn main() -> Result<()> {
 
     // SILVER faucet
     client.rng().fill_bytes(&mut seed);
-    let silver_key = AuthSecretKey::new_rpo_falcon512();
+    let silver_key = AuthSecretKey::new_falcon512_rpo();
     let silver_faucet_account = AccountBuilder::new(seed)
         .account_type(AccountType::FungibleFaucet)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(silver_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(silver_key.public_key().to_commitment()))
         .with_component(BasicFungibleFaucet::new(
             TokenSymbol::new("SILVER")?,
             0,
@@ -334,11 +331,11 @@ async fn main() -> Result<()> {
 
     // Maker wallet
     client.rng().fill_bytes(&mut seed);
-    let maker_key = AuthSecretKey::new_rpo_falcon512();
+    let maker_key = AuthSecretKey::new_falcon512_rpo();
     let maker_account = AccountBuilder::new(seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(maker_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(maker_key.public_key().to_commitment()))
         .with_component(BasicWallet)
         .build()?;
     let maker_id = maker_account.id();
@@ -350,11 +347,11 @@ async fn main() -> Result<()> {
 
     // Taker wallet
     client.rng().fill_bytes(&mut seed);
-    let taker_key = AuthSecretKey::new_rpo_falcon512();
+    let taker_key = AuthSecretKey::new_falcon512_rpo();
     let taker_account = AccountBuilder::new(seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(taker_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(taker_key.public_key().to_commitment()))
         .with_component(BasicWallet)
         .build()?;
     let taker_id = taker_account.id();
@@ -366,11 +363,11 @@ async fn main() -> Result<()> {
 
     // Treasury wallet (receives fees)
     client.rng().fill_bytes(&mut seed);
-    let treasury_key = AuthSecretKey::new_rpo_falcon512();
+    let treasury_key = AuthSecretKey::new_falcon512_rpo();
     let treasury_account = AccountBuilder::new(seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(treasury_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(treasury_key.public_key().to_commitment()))
         .with_component(BasicWallet)
         .build()?;
     let treasury_id = treasury_account.id();
@@ -393,24 +390,39 @@ async fn main() -> Result<()> {
     let treasury_prefix: u64 = treasury_id.prefix().into();
     let treasury_suffix: u64 = treasury_id.suffix().into();
 
-    let oracle_component = AccountComponent::compile(
-        &fee_oracle_code,
-        TransactionKernel::assembler().with_debug_mode(true),
+    let oracle_component_code = client
+        .code_builder()
+        .compile_component_code("lumina::fee_oracle", &fee_oracle_code)
+        .context("Failed to compile fee_oracle.masm")?;
+    let oracle_component = AccountComponent::new(
+        oracle_component_code,
         vec![
-            StorageSlot::Value(Word::from([Felt::new(FEE_BPS), ZERO, ZERO, ZERO])),
-            StorageSlot::Value(Word::from([Felt::new(treasury_prefix), ZERO, ZERO, ZERO])),
-            StorageSlot::Value(Word::from([Felt::new(treasury_suffix), ZERO, ZERO, ZERO])),
+            StorageSlot::with_value(
+                StorageSlotName::new("lumina::fee_oracle::fee_bps")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                Word::from([Felt::new(FEE_BPS), ZERO, ZERO, ZERO]),
+            ),
+            StorageSlot::with_value(
+                StorageSlotName::new("lumina::fee_oracle::treasury_prefix")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                Word::from([Felt::new(treasury_prefix), ZERO, ZERO, ZERO]),
+            ),
+            StorageSlot::with_value(
+                StorageSlotName::new("lumina::fee_oracle::treasury_suffix")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                Word::from([Felt::new(treasury_suffix), ZERO, ZERO, ZERO]),
+            ),
         ],
     )
-    .context("Failed to compile fee_oracle.masm")?
+    .context("Failed to create oracle component")?
     .with_supports_all_types();
 
-    let oracle_key = AuthSecretKey::new_rpo_falcon512();
+    let oracle_key = AuthSecretKey::new_falcon512_rpo();
     client.rng().fill_bytes(&mut seed);
     let fee_oracle_account = AccountBuilder::new(seed)
         .account_type(AccountType::RegularAccountImmutableCode)
         .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(oracle_key.public_key().to_commitment()))
+        .with_auth_component(AuthFalcon512Rpo::new(oracle_key.public_key().to_commitment()))
         .with_component(BasicWallet)
         .with_component(oracle_component)
         .build()?;
@@ -426,7 +438,7 @@ async fn main() -> Result<()> {
     // Deploy Fee Oracle (register on-chain via nop transaction)
     println!("\n--- Deploying Fee Oracle ---");
     let deploy_script = client
-        .script_builder()
+        .code_builder()
         .compile_tx_script("begin nop end")
         .context("Failed to compile deploy script")?;
     let deploy_req = TransactionRequestBuilder::new()
@@ -481,19 +493,21 @@ async fn main() -> Result<()> {
     // Maker consumes GOLD
     let maker_notes = client.get_consumable_notes(Some(maker_id)).await?;
     if !maker_notes.is_empty() {
-        let ids: Vec<_> = maker_notes.iter().map(|(n, _)| n.id()).collect();
-        let req = TransactionRequestBuilder::new().build_consume_notes(ids)?;
+        let maker_notes_len = maker_notes.len();
+        let notes: Vec<Note> = maker_notes.into_iter().map(|(n, _)| n.try_into().unwrap()).collect();
+        let req = TransactionRequestBuilder::new().build_consume_notes(notes)?;
         client.submit_new_transaction(maker_id, req).await?;
-        println!("  Maker consumed {} mint note(s)", maker_notes.len());
+        println!("  Maker consumed {} mint note(s)", maker_notes_len);
     }
 
     // Taker consumes SILVER
     let taker_notes = client.get_consumable_notes(Some(taker_id)).await?;
     if !taker_notes.is_empty() {
-        let ids: Vec<_> = taker_notes.iter().map(|(n, _)| n.id()).collect();
-        let req = TransactionRequestBuilder::new().build_consume_notes(ids)?;
+        let taker_notes_len = taker_notes.len();
+        let notes: Vec<Note> = taker_notes.into_iter().map(|(n, _)| n.try_into().unwrap()).collect();
+        let req = TransactionRequestBuilder::new().build_consume_notes(notes)?;
         client.submit_new_transaction(taker_id, req).await?;
-        println!("  Taker consumed {} mint note(s)", taker_notes.len());
+        println!("  Taker consumed {} mint note(s)", taker_notes_len);
     }
 
     // Wait for consumption
@@ -511,14 +525,13 @@ async fn main() -> Result<()> {
 
     // Compile oracle code as standalone library to extract get_fee_bps MAST root hash.
     // This hash is needed by pswap.masm to call the oracle via FPI (execute_foreign_procedure).
-    let assembler = TransactionKernel::assembler().with_debug_mode(true);
+    let assembler = TransactionKernel::assembler();
     let source_manager = Arc::new(miden_assembly::DefaultSourceManager::default());
     let oracle_module = miden_assembly::ast::Module::parser(miden_assembly::ast::ModuleKind::Library)
         .parse_str(
-            miden_assembly::LibraryPath::new("external_contract::fee_oracle")
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            "external_contract::fee_oracle",
             &fee_oracle_code,
-            &source_manager,
+            source_manager.clone(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let oracle_lib = assembler.clone().assemble_library([oracle_module])
@@ -531,12 +544,19 @@ async fn main() -> Result<()> {
     let mut hash_3: u64 = 0;
     println!("\n  === Oracle Library Procedure Digests ===");
     for export in oracle_lib.exports() {
-        let digest = oracle_lib.mast_forest()[export.node].digest();
-        let name_str = format!("{}", export.name);
-        println!("    {}: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+        let Some(proc_export) = export.as_procedure() else {
+            continue;
+        };
+        let digest = oracle_lib.mast_forest()[proc_export.node].digest();
+        let name_str = format!("{}", proc_export.path);
+        println!(
+            "    {}: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
             name_str,
-            digest[0].as_int(), digest[1].as_int(),
-            digest[2].as_int(), digest[3].as_int());
+            digest[0].as_int(),
+            digest[1].as_int(),
+            digest[2].as_int(),
+            digest[3].as_int()
+        );
         if name_str.ends_with("get_fee_bps") {
             hash_0 = digest[0].as_int();
             hash_1 = digest[1].as_int();
@@ -550,52 +570,85 @@ async fn main() -> Result<()> {
     let oracle_prefix: u64 = fee_oracle_id.prefix().into();
     let oracle_suffix: u64 = fee_oracle_id.suffix().into();
 
-    let pswap_code = std::fs::read_to_string("masm/notes/pswap.masm")?
+    let mut pswap_code = std::fs::read_to_string("masm/notes/pswap_with_fee.masm")?
         .replace(
-            "const.FEE_ORACLE_PREFIX=0x085e1bc7eb50221",
-            &format!("const.FEE_ORACLE_PREFIX=0x{:x}", oracle_prefix),
+            "const FEE_ORACLE_PREFIX = 0x085e1bc7eb50221",
+            &format!("const FEE_ORACLE_PREFIX = 0x{:x}", oracle_prefix),
         )
         .replace(
-            "const.FEE_ORACLE_SUFFIX=0x010055105b091fb",
-            &format!("const.FEE_ORACLE_SUFFIX=0x{:x}", oracle_suffix),
+            "const FEE_ORACLE_SUFFIX = 0x010055105b091fb",
+            &format!("const FEE_ORACLE_SUFFIX = 0x{:x}", oracle_suffix),
         )
         .replace(
-            "const.GET_FEE_BPS_HASH_0=0x5975cc7bc789e292",
-            &format!("const.GET_FEE_BPS_HASH_0=0x{:x}", hash_0),
+            "const GET_FEE_BPS_HASH_0 = 0x5975cc7bc789e292",
+            &format!("const GET_FEE_BPS_HASH_0 = 0x{:x}", hash_0),
         )
         .replace(
-            "const.GET_FEE_BPS_HASH_1=0x07c773a6f2ef5804",
-            &format!("const.GET_FEE_BPS_HASH_1=0x{:x}", hash_1),
+            "const GET_FEE_BPS_HASH_1 = 0x07c773a6f2ef5804",
+            &format!("const GET_FEE_BPS_HASH_1 = 0x{:x}", hash_1),
         )
         .replace(
-            "const.GET_FEE_BPS_HASH_2=0x57a4c0788fd079b5",
-            &format!("const.GET_FEE_BPS_HASH_2=0x{:x}", hash_2),
+            "const GET_FEE_BPS_HASH_2 = 0x57a4c0788fd079b5",
+            &format!("const GET_FEE_BPS_HASH_2 = 0x{:x}", hash_2),
         )
         .replace(
-            "const.GET_FEE_BPS_HASH_3=0x4f62f0774d5e8d88",
-            &format!("const.GET_FEE_BPS_HASH_3=0x{:x}", hash_3),
+            "const GET_FEE_BPS_HASH_3 = 0x4f62f0774d5e8d88",
+            &format!("const GET_FEE_BPS_HASH_3 = 0x{:x}", hash_3),
         );
+
+    // Derive P2ID script root from SDK at runtime to avoid version drift.
+    let p2id_probe = build_p2id_recipient(maker_id, [ZERO, ZERO, ZERO, ZERO].into())?;
+    let p2id_root = p2id_probe.script().root();
+    let p2id_words = [
+        p2id_root[0].as_int(),
+        p2id_root[1].as_int(),
+        p2id_root[2].as_int(),
+        p2id_root[3].as_int(),
+    ];
+
+    let mut lines: Vec<String> = pswap_code.lines().map(|l| l.to_string()).collect();
+    let mut injected = false;
+    for i in 1..lines.len() {
+        if lines[i].contains("mem_storew_be.P2ID_SCRIPT_ROOT_WORD dropw")
+            && lines[i - 1].trim_start().starts_with("push.")
+        {
+            let indent: String = lines[i - 1].chars().take_while(|c| c.is_whitespace()).collect();
+            lines[i - 1] = format!(
+                "{indent}push.{}.{}.{}.{}",
+                p2id_words[0], p2id_words[1], p2id_words[2], p2id_words[3]
+            );
+            injected = true;
+            break;
+        }
+    }
+    if !injected {
+        return Err(anyhow::anyhow!(
+            "Failed to inject P2ID root into pswap_with_fee.masm"
+        ));
+    }
+    pswap_code = lines.join("\n");
 
     println!("\n  Fee Oracle: {} (on-chain)", fee_oracle_id.to_hex());
     println!("  Oracle prefix: 0x{:x}", oracle_prefix);
     println!("  Oracle suffix: 0x{:x}", oracle_suffix);
     println!("  get_fee_bps hash: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]", hash_0, hash_1, hash_2, hash_3);
 
-    let note_script = ScriptBuilder::new(true)
+    let note_script = client
+        .code_builder()
         .compile_note_script(pswap_code)
         .context("Failed to compile PSWAP script")?;
 
     let offered_asset = Asset::Fungible(FungibleAsset::new(gold_faucet, OFFERED_AMOUNT)?);
     let requested_asset = Asset::Fungible(FungibleAsset::new(silver_faucet, REQUESTED_AMOUNT)?);
 
-    let swap_serial_num: Word = [Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)].into();
+    let root_swap_serial: Word = [Felt::new(1), Felt::new(2), Felt::new(3), Felt::new(4)].into();
 
     let swapp_note = create_pswap_note(
         maker_id,
         maker_id,
         offered_asset.clone(),
         requested_asset.clone(),
-        swap_serial_num,
+        root_swap_serial,
         0,
         &note_script,
         NoteType::Public,
@@ -604,14 +657,22 @@ async fn main() -> Result<()> {
     )?;
     let swapp_tag = swapp_note.metadata().tag();
     let swapp_note_id = swapp_note.id();
+    let swap_serial_num = swapp_note.serial_num();
 
     println!("\n=== PSWAP NOTE CREATED ===");
     println!("  Note ID: {}", swapp_note_id.to_hex());
     println!("  Tag: {:?}", swapp_tag);
+    println!(
+        "  Serial: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+        swap_serial_num[0].as_int(),
+        swap_serial_num[1].as_int(),
+        swap_serial_num[2].as_int(),
+        swap_serial_num[3].as_int()
+    );
 
     // Register tags for discovery
     client.add_note_tag(swapp_tag).await?;
-    let p2id_tag = NoteTag::from_account_id(maker_id);
+    let p2id_tag = NoteTag::with_account_target(maker_id);
     client.add_note_tag(p2id_tag).await?;
 
     // Submit SWAPP creation
@@ -656,10 +717,12 @@ async fn main() -> Result<()> {
 
     // Verify taker has SILVER to fill
     if let Ok(Some(taker_record)) = client.get_account(taker_id).await {
-        let silver_balance = taker_record.account().vault().get_balance(silver_faucet).unwrap_or(0);
-        println!("  Taker SILVER balance: {}", silver_balance);
-        if silver_balance < FILL_AMOUNT {
-            return Err(anyhow::anyhow!("Taker doesn't have enough SILVER: {} < {}", silver_balance, FILL_AMOUNT));
+        if let AccountRecordData::Full(taker_acct) = taker_record.account_data() {
+            let silver_balance = taker_acct.vault().get_balance(silver_faucet).unwrap_or(0);
+            println!("  Taker SILVER balance: {}", silver_balance);
+            if silver_balance < FILL_AMOUNT {
+                return Err(anyhow::anyhow!("Taker doesn't have enough SILVER: {} < {}", silver_balance, FILL_AMOUNT));
+            }
         }
     }
 
@@ -718,7 +781,7 @@ async fn main() -> Result<()> {
     println!("\nExpected Fee P2ID Note ID: {}", expected_fee_p2id_id.to_hex());
     println!("  Contains: {} SILVER (fee to treasury)", fee_amount);
 
-    // Compute expected leftover SWAPP
+    // Compute expected leftover SWAPP (private output in fee path).
     let leftover_offered_asset = Asset::Fungible(FungibleAsset::new(gold_faucet, leftover_offered)?);
     let leftover_requested_asset = Asset::Fungible(FungibleAsset::new(silver_faucet, leftover_requested)?);
 
@@ -731,39 +794,41 @@ async fn main() -> Result<()> {
         next_swap_count,
         &note_script,
         swap_serial_num,
-        NoteType::Public,
-        Some(treasury_id),  // Treasury for future fees
+        NoteType::Private,
+        Some(treasury_id),
     )?;
     let expected_leftover_id = expected_leftover.id();
-    println!("\nExpected Leftover Note ID: {}", expected_leftover_id.to_hex());
+    println!("\nExpected Leftover Note ID (private): {}", expected_leftover_id.to_hex());
 
     // Debug: verify oracle code is intact in client store
     println!("\n=== DEBUG: FEE ORACLE CODE VERIFICATION ===");
     if let Ok(Some(oracle_record)) = client.get_account(fee_oracle_id).await {
-        let oracle_code = oracle_record.account().code();
-        let oracle_mast = oracle_code.mast();
-        println!("  Oracle code procedures: {}", oracle_code.procedures().len());
-        println!("  Oracle MAST forest nodes: {}", oracle_mast.num_nodes());
-        println!("  Oracle MAST local procedure digests:");
-        for digest in oracle_mast.local_procedure_digests() {
-            println!("    {:?}", digest);
-            // Check if this matches our expected hash
-            let d0 = Felt::from(digest[0]).as_int();
-            let d1 = Felt::from(digest[1]).as_int();
-            let d2 = Felt::from(digest[2]).as_int();
-            let d3 = Felt::from(digest[3]).as_int();
-            if d0 == hash_0 && d1 == hash_1 && d2 == hash_2 && d3 == hash_3 {
-                println!("      ^^^ MATCHES get_fee_bps hash!");
+        if let AccountRecordData::Full(oracle_acct) = oracle_record.account_data() {
+            let oracle_code = oracle_acct.code();
+            let oracle_mast = oracle_code.mast();
+            println!("  Oracle code procedures: {}", oracle_code.procedures().len());
+            println!("  Oracle MAST forest nodes: {}", oracle_mast.num_nodes());
+            println!("  Oracle MAST local procedure digests:");
+            for digest in oracle_mast.local_procedure_digests() {
+                println!("    {:?}", digest);
+                // Check if this matches our expected hash
+                let d0 = Felt::from(digest[0]).as_int();
+                let d1 = Felt::from(digest[1]).as_int();
+                let d2 = Felt::from(digest[2]).as_int();
+                let d3 = Felt::from(digest[3]).as_int();
+                if d0 == hash_0 && d1 == hash_1 && d2 == hash_2 && d3 == hash_3 {
+                    println!("      ^^^ MATCHES get_fee_bps hash!");
+                }
             }
-        }
-        println!("  Expected hash: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]", hash_0, hash_1, hash_2, hash_3);
-        println!("  Oracle code commitment: {:?}", oracle_code.commitment());
-        // Also print each procedure's MAST root
-        println!("  Oracle code procedures (by AccountCode):");
-        for (i, proc_info) in oracle_code.procedures().iter().enumerate() {
-            let root = proc_info.mast_root();
-            println!("    proc[{}]: root=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
-                i, root[0].as_int(), root[1].as_int(), root[2].as_int(), root[3].as_int());
+            println!("  Expected hash: [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]", hash_0, hash_1, hash_2, hash_3);
+            println!("  Oracle code commitment: {:?}", oracle_code.commitment());
+            // Also print each procedure's MAST root
+            println!("  Oracle code procedures (by AccountCode):");
+            for (i, proc_info) in oracle_code.procedures().iter().enumerate() {
+                let root = proc_info.mast_root();
+                println!("    proc[{}]: root=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+                    i, root[0].as_int(), root[1].as_int(), root[2].as_int(), root[3].as_int());
+            }
         }
     } else {
         println!("  WARNING: Oracle account not found in client store!");
@@ -778,19 +843,15 @@ async fn main() -> Result<()> {
     // Build and submit transaction with Fee Oracle as foreign account.
     // The ForeignAccount::public fetches the oracle's code from the network,
     // providing its MAST nodes to the TransactionMastStore for `dyn` dispatch.
+    let future_notes = vec![
+        (NoteDetails::from(expected_p2id.clone()), expected_p2id.metadata().tag()),
+        (NoteDetails::from(expected_fee_p2id.clone()), expected_fee_p2id.metadata().tag()),
+    ];
+
     let req = TransactionRequestBuilder::new()
-        .authenticated_input_notes([(swapp_note_id, Some(note_args))])
+        .input_notes([(swapp_note.clone(), Some(note_args))])
         .foreign_accounts([fee_oracle_foreign])
-        .expected_future_notes(vec![
-            (NoteDetails::from(expected_p2id.clone()), expected_p2id.metadata().tag()),
-            (NoteDetails::from(expected_fee_p2id.clone()), expected_fee_p2id.metadata().tag()),
-            (NoteDetails::from(expected_leftover.clone()), expected_leftover.metadata().tag()),
-        ])
-        .expected_output_recipients(vec![
-            expected_p2id.recipient().clone(),
-            expected_fee_p2id.recipient().clone(),
-            expected_leftover.recipient().clone(),
-        ])
+        .expected_future_notes(future_notes)
         .build()?;
 
     println!("\n--- Submitting Fill Transaction ---");
@@ -850,7 +911,8 @@ async fn main() -> Result<()> {
         for (note, _) in &consumable {
             if note.id() == expected_p2id_id {
                 println!("  P2ID consumable after {} attempts, consuming...", attempt);
-                let req = TransactionRequestBuilder::new().build_consume_notes(vec![note.id()])?;
+                let note_obj: Note = note.clone().try_into().unwrap();
+                let req = TransactionRequestBuilder::new().build_consume_notes(vec![note_obj])?;
                 client.submit_new_transaction(maker_id, req).await?;
                 p2id_consumed = true;
                 break;
@@ -881,20 +943,26 @@ async fn main() -> Result<()> {
     let mut treasury_silver = 0u64;
 
     if let Ok(Some(maker_record)) = client.get_account(maker_id).await {
-        let maker_vault = maker_record.account().vault();
-        maker_gold = maker_vault.get_balance(gold_faucet).unwrap_or(0);
-        maker_silver = maker_vault.get_balance(silver_faucet).unwrap_or(0);
+        if let AccountRecordData::Full(maker_acct) = maker_record.account_data() {
+            let maker_vault = maker_acct.vault();
+            maker_gold = maker_vault.get_balance(gold_faucet).unwrap_or(0);
+            maker_silver = maker_vault.get_balance(silver_faucet).unwrap_or(0);
+        }
     }
 
     if let Ok(Some(taker_record)) = client.get_account(taker_id).await {
-        let taker_vault = taker_record.account().vault();
-        taker_gold = taker_vault.get_balance(gold_faucet).unwrap_or(0);
-        taker_silver = taker_vault.get_balance(silver_faucet).unwrap_or(0);
+        if let AccountRecordData::Full(taker_acct) = taker_record.account_data() {
+            let taker_vault = taker_acct.vault();
+            taker_gold = taker_vault.get_balance(gold_faucet).unwrap_or(0);
+            taker_silver = taker_vault.get_balance(silver_faucet).unwrap_or(0);
+        }
     }
 
     if let Ok(Some(treasury_record)) = client.get_account(treasury_id).await {
-        let treasury_vault = treasury_record.account().vault();
-        treasury_silver = treasury_vault.get_balance(silver_faucet).unwrap_or(0);
+        if let AccountRecordData::Full(treasury_acct) = treasury_record.account_data() {
+            let treasury_vault = treasury_acct.vault();
+            treasury_silver = treasury_vault.get_balance(silver_faucet).unwrap_or(0);
+        }
     }
 
     println!("\n=== FINAL BALANCES (verified from chain) ===");
